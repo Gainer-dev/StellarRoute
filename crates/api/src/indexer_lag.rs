@@ -216,6 +216,11 @@ impl IndexerLagMonitor {
         Self::new(db, horizon_url, LagThresholds::default())
     }
 
+    /// Return the thresholds used by this monitor.
+    pub fn thresholds(&self) -> &LagThresholds {
+        &self.thresholds
+    }
+
     // ── Public API ────────────────────────────────────────────────────────
 
     /// Return the most recently cached lag snapshots.
@@ -233,6 +238,26 @@ impl IndexerLagMonitor {
             .iter()
             .find(|s| s.source == source)
             .cloned()
+    }
+
+    /// Check if any monitored source currently has critical lag.
+    pub async fn is_any_source_critical(&self) -> bool {
+        self.snapshots
+            .read()
+            .await
+            .iter()
+            .any(|s| s.status == SyncStatus::Critical)
+    }
+
+    /// Return the maximum lag (in ledgers) observed across all sources.
+    pub async fn max_lag_ledgers(&self) -> u64 {
+        self.snapshots
+            .read()
+            .await
+            .iter()
+            .map(|s| s.lag_ledgers)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Perform a single measurement cycle and update the cached snapshots.
@@ -310,11 +335,23 @@ impl IndexerLagMonitor {
 
     /// Fetch the most recently indexed SDEX ledger from the local DB.
     ///
-    /// Uses `MAX(last_modified_ledger)` from `sdex_offers` — the same field
-    /// the SDEX indexer writes on every upsert.
+    /// Prefers the SDEX poll heartbeat (`ingestion_state.sdex_last_horizon_ledger`)
+    /// written after each successful orderbook poll. Falls back to
+    /// `MAX(last_modified_ledger)` from `sdex_offers` for streaming / legacy rows
+    /// (offer ledgers can be far behind Horizon even when the book snapshot is fresh).
     async fn fetch_sdex_last_ledger(&self) -> Result<u64, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT COALESCE(MAX(last_modified_ledger), 0)::BIGINT AS seq FROM sdex_offers",
+            r#"
+            SELECT GREATEST(
+                COALESCE(
+                    (SELECT NULLIF(value, '')::BIGINT
+                     FROM ingestion_state
+                     WHERE key = 'sdex_last_horizon_ledger'),
+                    0
+                ),
+                COALESCE((SELECT MAX(last_modified_ledger) FROM sdex_offers), 0)
+            )::BIGINT AS seq
+            "#,
         )
         .fetch_one(&self.db)
         .await?;
@@ -440,6 +477,21 @@ pub mod tests {
     }
 
     #[test]
+    fn classify_default_threshold_boundary_cases() {
+        let t = LagThresholds::default();
+        let cases = [
+            (9, SyncStatus::Ok),
+            (10, SyncStatus::Warning),
+            (60, SyncStatus::Warning),
+            (61, SyncStatus::Critical),
+        ];
+
+        for (lag_ledgers, expected) in cases {
+            assert_eq!(t.classify(lag_ledgers), expected, "lag={lag_ledgers}");
+        }
+    }
+
+    #[test]
     fn custom_thresholds_are_respected() {
         let t = LagThresholds {
             warning_ledgers: 5,
@@ -470,6 +522,15 @@ pub mod tests {
         assert_eq!(snap.lag_ledgers, 10);
         assert!((snap.lag_seconds - 50.0).abs() < 1e-9);
         assert_eq!(snap.status, SyncStatus::Warning);
+    }
+
+    #[test]
+    fn compute_handles_underflow_with_saturating_sub() {
+        let t = LagThresholds::default();
+        // If local is somehow ahead of Horizon (e.g. clock drift or caching), lag is 0
+        let snap = LagSnapshot::compute("sdex", 1001, 1000, &t);
+        assert_eq!(snap.lag_ledgers, 0);
+        assert_eq!(snap.status, SyncStatus::Ok);
     }
 
     #[test]

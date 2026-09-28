@@ -11,10 +11,14 @@
 //! Request logs and decision stages include matching `request_id` values.
 
 use axum::{extract::State, Json};
+use opentelemetry::trace::TraceContextExt;
+use serde_json::{Map, Value};
 use sqlx::Row;
 use std::sync::Arc;
 use tokio::time::timeout;
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{debug, info_span, warn, Instrument, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
 
 use stellarroute_routing::health::filter::GraphFilter;
 use stellarroute_routing::health::freshness::{FreshnessGuard, FreshnessOutcome};
@@ -25,6 +29,7 @@ use stellarroute_routing::health::scorer::{
 
 use crate::{
     audit::{AuditExclusion, AuditInputs, AuditOutcome, AuditPathStep, AuditSelected},
+    budget::{BudgetConfig, BudgetTracker, PipelineStage},
     cache,
     error::{ApiError, Result},
     middleware::{validation::ValidatedQuoteRequest, RequestId},
@@ -32,7 +37,8 @@ use crate::{
         request::{AssetPath, QuoteParams},
         AssetInfo, ExcludedVenueInfo as ApiExcludedVenueInfo,
         ExclusionDiagnostics as ApiExclusionDiagnostics, ExclusionReason as ApiExclusionReason,
-        PathStep, QuoteRationaleMetadata, QuoteResponse, VenueEvaluation,
+        PathStep, PreparedQuoteResponse, QuoteExpirationWebhookPayload, QuoteRationaleMetadata,
+        QuoteResponse, VenueEvaluation,
     },
     state::AppState,
 };
@@ -50,12 +56,52 @@ use crate::{
         ("amount" = Option<String>, Query, description = "Amount to trade (default: 1)"),
         ("slippage_bps" = Option<u32>, Query, description = "Slippage tolerance in basis points (default: 50)"),
         ("quote_type" = Option<String>, Query, description = "Type of quote: 'sell' or 'buy' (default: sell)"),
+        ("fields" = Option<String>, Query, description = "Optional comma-separated top-level quote fields to include (e.g., 'price,total,path'). Unknown fields return 400."),
     ),
     responses(
         (status = 200, description = "Price quote", body = QuoteResponse),
-        (status = 400, description = "Invalid parameters", body = ErrorResponse),
-        (status = 404, description = "No route found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (
+            status = 400,
+            description = "Invalid parameters",
+            body = crate::models::ErrorResponse,
+            example = json!({
+                "v": 1,
+                "timestamp": 1740312000000_i64,
+                "request_id": "req_01hyxk6bzv4n9p8m8j1f4c0a2r",
+                "data": {
+                    "error": "validation_error",
+                    "message": "Amount must be greater than zero"
+                }
+            })
+        ),
+        (
+            status = 404,
+            description = "No route found",
+            body = crate::models::ErrorResponse,
+            example = json!({
+                "v": 1,
+                "timestamp": 1740312000000_i64,
+                "request_id": "req_01hyxk6bzv4n9p8m8j1f4c0a2r",
+                "data": {
+                    "error": "no_route",
+                    "message": "No trading route found for this pair"
+                }
+            })
+        ),
+        (
+            status = 500,
+            description = "Internal server error",
+            body = crate::models::ErrorResponse,
+            example = json!({
+                "v": 1,
+                "timestamp": 1740312000000_i64,
+                "request_id": "req_01hyxk6bzv4n9p8m8j1f4c0a2r",
+                "data": {
+                    "error": "internal_error",
+                    "message": "An internal error occurred"
+                }
+            })
+        ),
     )
 )]
 pub async fn get_quote(
@@ -63,7 +109,7 @@ pub async fn get_quote(
     headers: axum::http::HeaderMap,
     request_id: RequestId,
     request: crate::middleware::validation::ValidatedQuoteRequest,
-) -> Result<Json<crate::models::ApiResponse<QuoteResponse>>> {
+) -> Result<axum::response::Response> {
     let ValidatedQuoteRequest {
         base: base_asset,
         quote: quote_asset,
@@ -79,6 +125,8 @@ pub async fn get_quote(
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let explain = explain_header || params.explain.unwrap_or(false);
+    let selected_fields = params.selected_fields();
+    let consumer_id = extract_consumer_id(&headers);
 
     let start_time = std::time::Instant::now();
 
@@ -102,7 +150,8 @@ pub async fn get_quote(
         )
         .await
         {
-            Ok((quote_resp, cache_hit)) => {
+            Ok((prepared_quote, cache_hit)) => {
+                let quote_resp = prepared_quote.into_quote()?;
                 let error_class = "none";
                 let latency_ms = start_time.elapsed().as_millis() as u64;
 
@@ -144,8 +193,43 @@ pub async fn get_quote(
                     audit_exclusions,
                 );
 
-                let envelope = crate::models::ApiResponse::new(quote_resp, request_id.to_string());
-                Ok(Json(envelope))
+                // ── Spawn delayed webhook dispatch ──────────────────────
+                if let Some(consumer_id) = consumer_id.clone() {
+                    if let Some(expires_at) = quote_resp.expires_at {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let delay_ms = if expires_at > now {
+                            expires_at - now
+                        } else {
+                            0
+                        };
+                        let payload = build_quote_webhook_payload(
+                            consumer_id.clone(),
+                            &base,
+                            &quote,
+                            &quote_resp,
+                        );
+                        state
+                            .quote_expiration_webhooks
+                            .clone()
+                            .spawn_delayed_dispatch_for_consumer(
+                                consumer_id,
+                                payload,
+                                std::time::Duration::from_millis(delay_ms as u64),
+                            );
+                    }
+                }
+
+                let data = if let Some(fields) = &selected_fields {
+                    build_sparse_quote_data(&quote_resp, fields)?
+                } else {
+                    serde_json::to_value(quote_resp)
+                        .map_err(|e| ApiError::Internal(Arc::new(anyhow::anyhow!(e))))?
+                };
+                let envelope = crate::models::ApiResponse::new(data, request_id.to_string());
+                crate::compression::json_response(
+                    &envelope,
+                    headers.get(axum::http::header::ACCEPT_ENCODING),
+                )
             }
             Err(e) => {
                 let (error_class, audit_outcome) = match &e {
@@ -381,6 +465,7 @@ pub async fn get_batch_quotes(
                         .quote_type
                         .unwrap_or(crate::models::request::QuoteType::Sell),
                     explain: None,
+                    fields: None,
                 };
 
                 let base_asset = match AssetPath::parse(&item.base) {
@@ -409,7 +494,13 @@ pub async fn get_batch_quotes(
                 };
 
                 match get_quote_inner(state, base_asset, quote_asset, params, false).await {
-                    Ok((quote, _cache_hit)) => BatchQuoteItemResult::ok(i, quote),
+                    Ok((prepared_quote, _cache_hit)) => match prepared_quote.into_quote() {
+                        Ok(quote) => BatchQuoteItemResult::ok(i, quote),
+                        Err(e) => {
+                            let (code, message) = batch_error_from_api_error(&e);
+                            BatchQuoteItemResult::err(i, BatchItemError { code, message })
+                        }
+                    },
                     Err(e) => {
                         let (code, message) = batch_error_from_api_error(&e);
                         BatchQuoteItemResult::err(i, BatchItemError { code, message })
@@ -469,13 +560,13 @@ fn batch_error_from_api_error(e: &ApiError) -> (String, String) {
     }
 }
 
-async fn get_quote_inner(
+pub(crate) async fn get_quote_inner(
     state: Arc<AppState>,
     base_asset: AssetPath,
     quote_asset: AssetPath,
     params: QuoteParams,
     explain: bool,
-) -> Result<(QuoteResponse, bool)> {
+) -> Result<(PreparedQuoteResponse, bool)> {
     let base = base_asset.to_canonical();
     let quote = quote_asset.to_canonical();
 
@@ -520,7 +611,7 @@ async fn get_quote_inner(
     let quote_cache_key_c = quote_cache_key.clone();
 
     // Use single-flight to coalesce identical concurrent requests
-    let result_arc: Arc<crate::error::Result<(QuoteResponse, bool)>> = state
+    let result_arc: Arc<crate::error::Result<(PreparedQuoteResponse, bool)>> = state
         .quote_single_flight
         .execute(&quote_cache_key, || async move {
             let state = state_c;
@@ -528,117 +619,75 @@ async fn get_quote_inner(
             let quote = quote_c;
             let quote_cache_key = quote_cache_key_c;
 
-            // Try to get from cache first (inside single-flight so we only compute once if miss)
+            // Return pre-serialized JSON on hot cache hits to avoid deserializing and reserializing.
             if let Some(cache) = &state.cache {
                 if let Ok(mut cache) = cache.try_lock() {
-                    if let Some(cached) = cache.get::<QuoteResponse>(&quote_cache_key).await {
-                        state.cache_metrics.inc_quote_hit();
-                        crate::metrics::record_cache_hit("quote");
-                        tracing::Span::current().record("cache_hit", true);
-                        debug!("Returning cached quote for {}/{}", base, quote);
-                        // SingleFlight expects Arc<Result<(QuoteResponse, bool)>>
-                        return Arc::new(Ok((cached, true)));
+                    match cache.get_json(&quote_cache_key).await {
+                        crate::cache::CacheResult::Hit(cached_json) => {
+                            state.cache_metrics.inc_quote_hit();
+                            crate::metrics::record_cache_hit("quote");
+                            tracing::Span::current().record("cache_hit", true);
+                            debug!("Returning cached quote for {}/{}", base, quote);
+                            return Arc::new(Ok((
+                                PreparedQuoteResponse::from_cached_json(cached_json),
+                                true,
+                            )));
+                        }
+                        crate::cache::CacheResult::Miss => {
+                            crate::metrics::record_cache_miss("quote");
+                        }
+                        crate::cache::CacheResult::Unavailable => {
+                            debug!(
+                                "Redis unavailable for quote cache lookup {}/{}; computing fresh quote",
+                                base, quote
+                            );
+                        }
                     }
                 }
+            } else {
+                crate::metrics::record_cache_miss("quote");
             }
 
-            // Cache miss
-            crate::metrics::record_cache_miss("quote");
+            // Cache miss or Redis unavailable — compute from DB/routing.
 
             // Compute best price with freshness scoring
-            let compute_res =
-                find_best_price(&state, &base_asset, &quote_asset, base_id, quote_id, amount).await;
-
-            let (
-                price,
-                path,
-                rationale,
-                api_diagnostics,
-                freshness_outcome,
-                fresh_timestamps,
-                liquidity_snapshot,
-            ) = match compute_res {
-                Ok(res) => res,
+            let response = match compute_quote_response(
+                state.clone(),
+                base_asset,
+                quote_asset,
+                params,
+                explain,
+            )
+            .await
+            {
+                Ok(response) => response,
                 Err(e) => return Arc::new(Err(e)),
             };
 
-            // Increment stale inputs metrics
-            let stale_count = freshness_outcome.stale.len();
-            if stale_count > 0 {
-                state
-                    .cache_metrics
-                    .add_stale_inputs_excluded(stale_count as u64);
-            }
-
-            let total = amount * price;
-            let timestamp = chrono::Utc::now().timestamp_millis();
-            let ttl_seconds = u32::try_from(state.cache_policy.quote_ttl.as_secs()).ok();
-            let expires_at = i64::try_from(state.cache_policy.quote_ttl.as_millis())
-                .ok()
-                .map(|ttl_ms| timestamp + ttl_ms);
-
-            let source_timestamp = fresh_timestamps
-                .iter()
-                .min()
-                .map(|ts| ts.timestamp_millis());
-
-            let data_freshness = Some(crate::models::DataFreshness {
-                fresh_count: freshness_outcome.fresh.len(),
-                stale_count: freshness_outcome.stale.len(),
-                max_staleness_secs: freshness_outcome.max_staleness_secs,
-            });
-
-            let response = QuoteResponse {
-                base_asset: asset_path_to_info(&base_asset),
-                quote_asset: asset_path_to_info(&quote_asset),
-                amount: format!("{:.7}", amount),
-                price: format!("{:.7}", price),
-                total: format!("{:.7}", total),
-                quote_type: quote_type_str.to_string(),
-                path,
-                timestamp,
-                expires_at,
-                source_timestamp,
-                ttl_seconds,
-                rationale: Some(rationale),
-                exclusion_diagnostics: Some(api_diagnostics),
-                data_freshness,
-                price_impact: None, // Will be computed in Phase 3
+            let prepared = match PreparedQuoteResponse::from_quote(response) {
+                Ok(prepared) => prepared,
+                Err(e) => return Arc::new(Err(e)),
             };
 
-            // Cache the response
+            // Cache the serialized JSON once so future hits skip serde work.
+            // Apply jitter to the TTL to prevent synchronized expiry storms
+            // across hot pairs (cache stampede protection).
             if let Some(cache) = &state.cache {
                 if let Ok(mut cache) = cache.try_lock() {
+                    let jitter = crate::cache::JitteredTtl::default();
+                    let jittered_ttl = jitter.apply(state.cache_policy.quote_ttl);
                     let _ = cache
-                        .set(&quote_cache_key, &response, state.cache_policy.quote_ttl)
+                        .set_json(
+                            &quote_cache_key,
+                            std::str::from_utf8(prepared.json_bytes())
+                                .expect("quote JSON serialization is valid UTF-8"),
+                            jittered_ttl,
+                        )
                         .await;
                 }
             }
 
-            // [Replay] Non-blocking capture — fire-and-forget, zero latency impact
-            if let Some(hook) = &state.replay_capture {
-                use stellarroute_routing::health::scorer::HealthScoringConfig;
-                let hc = HealthScoringConfig::default();
-                let health_config = crate::replay::artifact::HealthConfigSnapshot {
-                    freshness_threshold_secs_sdex: hc.freshness_threshold_secs.sdex,
-                    freshness_threshold_secs_amm: hc.freshness_threshold_secs.amm,
-                    staleness_threshold_secs: hc.staleness_threshold_secs,
-                    min_tvl_threshold_e7: hc.min_tvl_threshold_e7,
-                };
-                hook.capture(
-                    &base,
-                    &quote,
-                    &format!("{:.7}", amount),
-                    slippage_bps,
-                    quote_type_str,
-                    liquidity_snapshot,
-                    health_config,
-                    &response,
-                    None,
-                );
-            }
-
-            Arc::new(Ok((response, false)))
+            Arc::new(Ok((prepared, false)))
         })
         .await;
 
@@ -646,6 +695,143 @@ async fn get_quote_inner(
         Ok(res) => res,
         Err(arc_res) => arc_res.as_ref().clone(),
     }
+}
+
+pub(crate) async fn compute_quote_response(
+    state: Arc<AppState>,
+    base_asset: AssetPath,
+    quote_asset: AssetPath,
+    params: QuoteParams,
+    _explain: bool,
+) -> Result<QuoteResponse> {
+    let base = base_asset.to_canonical();
+    let quote = quote_asset.to_canonical();
+
+    debug!(
+        "Getting data quote for {}/{} (amount: {:?}, type: {:?})",
+        base, quote, params.amount, params.quote_type
+    );
+
+    let amount: f64 = params
+        .amount
+        .as_deref()
+        .unwrap_or("1")
+        .parse()
+        .unwrap_or(1.0);
+
+    let quote_type_str = match params.quote_type {
+        crate::models::request::QuoteType::Sell => "sell",
+        crate::models::request::QuoteType::Buy => "buy",
+    };
+
+    let base_id = find_asset_id(&state, &base_asset).await?;
+    let quote_id = find_asset_id(&state, &quote_asset).await?;
+
+    // --- Indexer lag throttle ---
+    // Under sustained sync drift we reduce quote compute and return a degraded
+    // response instead of rejecting the request.
+    let is_critical = state.indexer_lag.is_any_source_critical().await;
+    let max_lag = if is_critical {
+        state.indexer_lag.max_lag_ledgers().await
+    } else {
+        0
+    };
+
+    let degrade_due_to_indexer_lag = is_critical;
+
+    if degrade_due_to_indexer_lag {
+        warn!(
+            max_lag_ledgers = max_lag,
+            "Indexer lag critical; returning degraded quote (reduced compute)"
+        );
+    }
+
+    let (
+        price,
+        path,
+        rationale,
+        api_diagnostics,
+        freshness_outcome,
+        fresh_timestamps,
+        liquidity_snapshot,
+        midpoint,
+        spread_bps,
+    ) = find_best_price(&state, &base_asset, &quote_asset, base_id, quote_id, amount).await?;
+
+    let stale_count = freshness_outcome.stale.len();
+    // Mixed freshness: stale venues are excluded from routing.
+    // All-stale soft-degrade keeps quoting those venues — do not count as excluded.
+    if stale_count > 0 && !freshness_outcome.fresh.is_empty() {
+        state
+            .cache_metrics
+            .add_stale_inputs_excluded(stale_count as u64);
+    }
+
+    let total = amount * price;
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let ttl_seconds = u32::try_from(state.cache_policy.quote_ttl.as_secs()).ok();
+    let expires_at = i64::try_from(state.cache_policy.quote_ttl.as_millis())
+        .ok()
+        .map(|ttl_ms| timestamp + ttl_ms);
+
+    let source_timestamp = fresh_timestamps
+        .iter()
+        .min()
+        .map(|ts| ts.timestamp_millis());
+
+    let data_freshness = Some(crate::models::DataFreshness {
+        fresh_count: freshness_outcome.fresh.len(),
+        stale_count: freshness_outcome.stale.len(),
+        max_staleness_secs: freshness_outcome.max_staleness_secs,
+    });
+
+    let response = QuoteResponse {
+        base_asset: asset_path_to_info(&base_asset),
+        quote_asset: asset_path_to_info(&quote_asset),
+        amount: format!("{:.7}", amount),
+        price: format!("{:.7}", price),
+        total: format!("{:.7}", total),
+        quote_type: quote_type_str.to_string(),
+        degraded: state.external_dependency_health.soroban_breaker_is_open()
+            || degrade_due_to_indexer_lag
+            || (freshness_outcome.fresh.is_empty() && !freshness_outcome.stale.is_empty()),
+        path,
+        timestamp,
+        expires_at,
+        source_timestamp,
+        ttl_seconds,
+        rationale: Some(rationale),
+        exclusion_diagnostics: Some(api_diagnostics),
+        data_freshness,
+        midpoint: midpoint.map(|m| format!("{:.7}", m)),
+        spread_bps,
+        price_impact: None,
+    };
+
+    if let Some(hook) = &state.replay_capture {
+        use stellarroute_routing::health::scorer::HealthScoringConfig;
+        let hc = HealthScoringConfig::default();
+        let health_config = crate::replay::artifact::HealthConfigSnapshot {
+            freshness_threshold_secs_sdex: hc.freshness_threshold_secs.sdex,
+            freshness_threshold_secs_amm: hc.freshness_threshold_secs.amm,
+            staleness_threshold_secs: hc.staleness_threshold_secs,
+            min_tvl_threshold_e7: hc.min_tvl_threshold_e7,
+        };
+        hook.capture(
+            &base,
+            &quote,
+            &format!("{:.7}", amount),
+            params.slippage_bps(),
+            quote_type_str,
+            liquidity_snapshot,
+            crate::replay::artifact::DecisionGraphSnapshot::default(),
+            health_config,
+            &response,
+            None,
+        );
+    }
+
+    Ok(response)
 }
 
 /// Get routing path for a trading pair
@@ -699,7 +885,7 @@ pub async fn get_route(
     let quote_id = find_asset_id(&state, &quote_asset).await?;
 
     // For route endpoint, we reuse the same logic but return a simplified response
-    let (_, path, _, _, _, _, _) =
+    let (_, path, _, _, _, _, _, _, _) =
         find_best_price(&state, &base_asset, &quote_asset, base_id, quote_id, amount).await?;
 
     let response = crate::models::RouteResponse {
@@ -724,7 +910,37 @@ type FindBestPriceResult = (
     FreshnessOutcome,
     Vec<chrono::DateTime<chrono::Utc>>,
     Vec<crate::replay::artifact::LiquidityCandidate>, // snapshot for replay capture
+    Option<f64>,                                      // midpoint
+    Option<u32>,                                      // spread_bps
 );
+
+#[derive(Debug, Clone)]
+struct SourceTraceContext {
+    trace_id: String,
+    span_id: String,
+}
+
+impl SourceTraceContext {
+    fn from_parts(trace_id: String, span_id: String) -> Option<Self> {
+        if trace_id.is_empty()
+            || span_id.is_empty()
+            || trace_id == "00000000000000000000000000000000"
+            || span_id == "0000000000000000"
+        {
+            return None;
+        }
+
+        Some(Self { trace_id, span_id })
+    }
+
+    fn to_otel_context(&self) -> Option<opentelemetry::Context> {
+        crate::tracing_config::TraceContext {
+            trace_id: self.trace_id.clone(),
+            span_id: self.span_id.clone(),
+        }
+        .to_otel_context()
+    }
+}
 
 #[tracing::instrument(
     name = "find_best_price",
@@ -744,11 +960,14 @@ async fn find_best_price(
     quote_id: uuid::Uuid,
     amount: f64,
 ) -> Result<FindBestPriceResult> {
-    // Parallel multi-source quote computation with adaptive timeouts
+    // Initialize budget tracker for per-stage timing enforcement
+    let mut budget_tracker = BudgetTracker::new(BudgetConfig::realtime());
+
+    // Stage 1: Fetch candidates from data sources
     let health_score = state.calculate_health_score().await;
     let dynamic_timeout = state.timeout_controller.calculate_timeout(health_score);
 
-    let start_fetch = std::time::Instant::now();
+    let fetch_guard = budget_tracker.stage(PipelineStage::FetchCandidates);
     let sdex_task = fetch_source_candidates(state, base_id, quote_id, "sdex");
     let amm_task = fetch_source_candidates(state, base_id, quote_id, "amm");
 
@@ -757,8 +976,11 @@ async fn find_best_price(
         timeout(dynamic_timeout, amm_task)
     );
 
-    let fetch_latency = start_fetch.elapsed();
-    state.timeout_controller.record_latency(fetch_latency);
+    let fetch_result = fetch_guard.complete();
+    budget_tracker.record(PipelineStage::FetchCandidates, fetch_result.clone());
+    state
+        .timeout_controller
+        .record_latency(fetch_result.duration());
 
     // Record metrics
     crate::metrics::record_adaptive_timeout(
@@ -781,8 +1003,22 @@ async fn find_best_price(
         Err(_) => warn!("AMM source timed out after {:?}", dynamic_timeout),
     }
 
-    // Deterministic merge: sort by price, then venue type, then ref
-    candidates.sort_by(|a, b| {
+    // Split candidates into direct and inverse (for midpoint/spread calculation)
+    let direct_candidates: Vec<DirectVenueCandidate> = candidates
+        .iter()
+        .filter(|c| !c.is_inverse)
+        .cloned()
+        .collect();
+
+    let inverse_candidates: Vec<DirectVenueCandidate> = candidates
+        .iter()
+        .filter(|c| c.is_inverse)
+        .cloned()
+        .collect();
+
+    // Deterministic merge for direct candidates (Req 2.1)
+    let mut sorted_direct = direct_candidates.clone();
+    sorted_direct.sort_by(|a, b| {
         a.price
             .partial_cmp(&b.price)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -790,11 +1026,31 @@ async fn find_best_price(
             .then_with(|| a.venue_ref.cmp(&b.venue_ref))
     });
 
-    // Capture a single wall-clock instant for both scorer_inputs construction and freshness eval
-    let now = chrono::Utc::now();
+    // Calculate market midpoint and spread across all fresh venues (Req 5.1)
+    let best_ask = direct_candidates
+        .iter()
+        .filter(|c| c.price > 0.0)
+        .map(|c| c.price)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Build VenueScorerInput from candidates
-    let scorer_inputs: Vec<VenueScorerInput> = candidates
+    let best_bid = inverse_candidates
+        .iter()
+        .filter(|c| c.price > 0.0)
+        .map(|c| 1.0 / c.price)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (midpoint, spread_bps) = match (best_ask, best_bid) {
+        (Some(ask), Some(bid)) if ask > 0.0 && bid > 0.0 => {
+            let mid = (ask + bid) / 2.0;
+            let spread = (ask - bid) / mid;
+            (Some(mid), Some((spread * 10000.0).max(0.0) as u32))
+        }
+        _ => (None, None),
+    };
+
+    // Stage 2: Freshness evaluation (only for direct candidates)
+    let now = chrono::Utc::now();
+    let scorer_inputs: Vec<VenueScorerInput> = direct_candidates
         .iter()
         .map(|c| {
             if c.venue_type == "amm" {
@@ -807,7 +1063,7 @@ async fn find_best_price(
                     reserve_a_e7: Some(c.available_amount_e7 as i128),
                     reserve_b_e7: Some(c.available_amount_e7 as i128),
                     tvl_e7: Some((c.available_amount_e7 * 2) as i128),
-                    last_updated_at: Some(now),
+                    last_updated_at: c.updated_at,
                 }
             } else {
                 VenueScorerInput {
@@ -819,48 +1075,34 @@ async fn find_best_price(
                     reserve_a_e7: None,
                     reserve_b_e7: None,
                     tvl_e7: None,
-                    last_updated_at: Some(now),
+                    last_updated_at: c.updated_at,
                 }
             }
         })
         .collect();
 
-    // Health scoring / exclusion policy (defaults match routing `HealthScoringConfig`)
+    let freshness_guard = budget_tracker.stage(PipelineStage::FreshnessEval);
     let health_config = HealthScoringConfig::default();
     let freshness_outcome =
         FreshnessGuard::evaluate(&scorer_inputs, &health_config.freshness_threshold_secs, now);
+    budget_tracker.record(PipelineStage::FreshnessEval, freshness_guard.complete());
 
-    tracing::Span::current().record("stale_count", freshness_outcome.stale.len());
-    tracing::Span::current().record("fresh_count", freshness_outcome.fresh.len());
+    // Prefer fresh venues. If the orderbook/AMM snapshot is entirely stale but
+    // liquidity still exists, soft-degrade: quote anyway and surface `degraded`
+    // + data_freshness so the UI can warn without blocking the swap.
+    let (routing_indices, mut stale_exclusion_entries) =
+        select_routing_indices_after_freshness(&freshness_outcome, &direct_candidates)?;
 
-    if freshness_outcome.fresh.is_empty() {
-        state.cache_metrics.inc_stale_rejection();
-        return Err(ApiError::StaleMarketData {
-            stale_count: freshness_outcome.stale.len(),
-            fresh_count: 0,
-            threshold_secs_sdex: health_config.freshness_threshold_secs.sdex,
-            threshold_secs_amm: health_config.freshness_threshold_secs.amm,
-        });
-    }
-
-    let fresh_candidates: Vec<DirectVenueCandidate> = freshness_outcome
-        .fresh
+    let fresh_candidates: Vec<DirectVenueCandidate> = routing_indices
         .iter()
-        .filter_map(|&idx| candidates.get(idx).cloned())
+        .filter_map(|&idx| direct_candidates.get(idx).cloned())
         .collect();
-    let fresh_scorer_inputs: Vec<&VenueScorerInput> = freshness_outcome
-        .fresh
+
+    link_source_traces(&candidates);
+
+    let fresh_scorer_inputs: Vec<&VenueScorerInput> = routing_indices
         .iter()
         .filter_map(|&idx| scorer_inputs.get(idx))
-        .collect();
-    let mut stale_exclusion_entries: Vec<ApiExcludedVenueInfo> = freshness_outcome
-        .stale
-        .iter()
-        .filter_map(|&idx| candidates.get(idx))
-        .map(|candidate| ApiExcludedVenueInfo {
-            venue_ref: candidate.venue_ref.clone(),
-            reason: ApiExclusionReason::StaleData,
-        })
         .collect();
 
     let scorer = HealthScorer {
@@ -891,7 +1133,13 @@ async fn find_best_price(
             last_updated_at: input.last_updated_at,
         })
         .collect();
+    // Stage 3: Health scoring
+    let health_scoring_guard = budget_tracker.stage(PipelineStage::HealthScoring);
     let scored = scorer.score_venues(&fresh_inputs_owned);
+    budget_tracker.record(
+        PipelineStage::HealthScoring,
+        health_scoring_guard.complete(),
+    );
 
     let mut overrides = state.kill_switch.get_override_registry().await;
     // Merge static config overrides into dynamic ones
@@ -907,14 +1155,35 @@ async fn find_best_price(
         circuit_breaker: Some(state.circuit_breaker.clone()),
     };
 
-    // Apply filter (pass empty edges — we just need diagnostics for this single-hop path)
+    // Provider kill-switches from admin/Redis (bridges remain non-executable separately).
+    let provider_policy = state.kill_switch.get_provider_policy().await;
+
+    // Stage 4: Policy filter
+    let policy_filter_guard = budget_tracker.stage(PipelineStage::PolicyFilter);
+    // Health exclusions remain diagnostic-only for single-hop quotes (pre-existing).
+    // Provider kill-switches actively remove candidates that carry provider metadata.
     let filter = GraphFilter::new(&policy);
-    let (_, routing_diagnostics) = filter.filter_edges(&[], &scored);
+    let (_, routing_diagnostics) =
+        filter.filter_edges_with_providers(&[], &scored, Some(&provider_policy));
+    let mut provider_excluded: Vec<ApiExcludedVenueInfo> = fresh_candidates
+        .iter()
+        .filter(|c| !provider_policy.is_provider_allowed(c.provider.as_deref()))
+        .map(|c| ApiExcludedVenueInfo {
+            venue_ref: c.venue_ref.clone(),
+            reason: ApiExclusionReason::Override,
+        })
+        .collect();
+    let fresh_candidates: Vec<DirectVenueCandidate> = fresh_candidates
+        .into_iter()
+        .filter(|c| provider_policy.is_provider_allowed(c.provider.as_deref()))
+        .collect();
+    budget_tracker.record(PipelineStage::PolicyFilter, policy_filter_guard.complete());
 
     tracing::info!(
         stage = "policy_filter",
         excluded = routing_diagnostics.excluded_venues.len(),
-        "Applied policy and threshold filters"
+        provider_excluded = provider_excluded.len(),
+        "Applied policy/threshold diagnostics and provider kill-switch filters"
     );
 
     // Convert routing diagnostics to API types, then prepend stale exclusions (Req 6.2)
@@ -946,16 +1215,32 @@ async fn find_best_price(
         .collect();
 
     stale_exclusion_entries.append(&mut health_exclusion_entries);
+    stale_exclusion_entries.append(&mut provider_excluded);
     let api_diagnostics = ApiExclusionDiagnostics {
         excluded_venues: stale_exclusion_entries,
     };
 
-    // Pass only fresh candidates to price evaluation (Req 2.2, 6.1)
+    // Stage 5: Venue selection
+    let venue_selection_guard = budget_tracker.stage(PipelineStage::VenueSelection);
+    // Pass only fresh, provider-allowed candidates to price evaluation (Req 2.2, 6.1)
     let (selected, rationale) = evaluate_single_hop_direct_venues(fresh_candidates, amount)?;
+    budget_tracker.record(
+        PipelineStage::VenueSelection,
+        venue_selection_guard.complete(),
+    );
 
-    // Collect last_updated_at timestamps for fresh scorer inputs (for source_timestamp, Req 3.1)
-    let fresh_timestamps: Vec<chrono::DateTime<chrono::Utc>> = freshness_outcome
-        .fresh
+    // Finalize budget tracking
+    let budget_summary = budget_tracker.finish();
+    if budget_summary.has_overruns() {
+        warn!(
+            overbudget_stages = ?budget_summary.overbudget_stages,
+            total_duration_ms = budget_summary.total_duration.as_millis() as u64,
+            "Quote pipeline budget overruns detected"
+        );
+    }
+
+    // Collect last_updated_at timestamps for routing candidates (for source_timestamp)
+    let fresh_timestamps: Vec<chrono::DateTime<chrono::Utc>> = routing_indices
         .iter()
         .filter_map(|&idx| scorer_inputs[idx].last_updated_at)
         .collect();
@@ -968,6 +1253,7 @@ async fn find_best_price(
             venue_ref: c.venue_ref.clone(),
             price: format!("{:.7}", c.price),
             available_amount: format!("{:.7}", c.available_amount),
+            fee_bps: Some(c.fee_bps),
         })
         .collect();
 
@@ -976,8 +1262,32 @@ async fn find_best_price(
         to_asset: asset_path_to_info(quote),
         price: format!("{:.7}", selected.price),
         source: selected.path_source(),
+        liquidity_depth: Some(format!("{:.7}", selected.available_amount)),
+        fee_bps: Some(selected.fee_bps),
     }];
 
+    // Optional Soroban simulation step for AMM venues. If configured and enabled,
+    // run a dry-run and convert explicit simulation failures into a NotExecutable error.
+    if selected.venue_type == "amm" && state.soroban_simulation_enabled {
+        if let Some(sim) = &state.soroban_simulator {
+            // Build a lightweight simulation payload. The real transaction XDR
+            // builder lives elsewhere; for dry-run validation we encode key
+            // route identifiers so tests/mocks can inspect the request.
+            let tx_xdr = format!(
+                "simulate:amm:{}:{}:{}",
+                selected.venue_ref, amount, selected.price
+            );
+
+            let sim_res = sim.simulate(&tx_xdr).await;
+
+            if sim_res.simulated && !sim_res.success {
+                let reason = sim_res
+                    .failure_reason
+                    .unwrap_or_else(|| "simulation_failure".to_string());
+                return Err(ApiError::NotExecutable(reason));
+            }
+        }
+    }
     Ok((
         selected.price,
         path,
@@ -986,7 +1296,19 @@ async fn find_best_price(
         freshness_outcome,
         fresh_timestamps,
         liquidity_snapshot,
+        midpoint,
+        spread_bps,
     ))
+}
+
+fn link_source_traces(candidates: &[DirectVenueCandidate]) {
+    for candidate in candidates {
+        if let Some(trace_context) = candidate.source_trace_context() {
+            if let Some(otel_context) = trace_context.to_otel_context() {
+                Span::current().add_link(otel_context.span().span_context().clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -997,6 +1319,19 @@ struct DirectVenueCandidate {
     available_amount: f64,
     price_e7: i64,
     available_amount_e7: i64,
+    source_trace_id: String,
+    source_span_id: String,
+    is_inverse: bool,
+    fee_bps: u32,
+    /// Optional liquidity provider id (when present, subject to kill-switch policy).
+    ///
+    /// Current `normalized_liquidity` has no provider column, so ingest sets this
+    /// to `None`. Provider kill-switches are forward-compatible and inert for
+    /// today's Stellar venues until ingest supplies provider metadata — do not
+    /// pretend current venues have providers.
+    provider: Option<String>,
+    /// Orderbook / pool snapshot time from `normalized_liquidity.updated_at`.
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl DirectVenueCandidate {
@@ -1011,6 +1346,52 @@ impl DirectVenueCandidate {
             "sdex".to_string()
         }
     }
+
+    fn source_trace_context(&self) -> Option<SourceTraceContext> {
+        SourceTraceContext::from_parts(self.source_trace_id.clone(), self.source_span_id.clone())
+    }
+}
+
+/// Choose which venue indices to route on after freshness classification.
+///
+/// Fresh venues win. If every venue is stale but liquidity rows still exist,
+/// soft-degrade onto the stale set instead of returning `StaleMarketData` — the
+/// quote response carries `degraded` + `data_freshness` so clients can warn.
+fn select_routing_indices_after_freshness(
+    freshness_outcome: &FreshnessOutcome,
+    direct_candidates: &[DirectVenueCandidate],
+) -> Result<(Vec<usize>, Vec<ApiExcludedVenueInfo>)> {
+    if !freshness_outcome.fresh.is_empty() {
+        let exclusions = freshness_outcome
+            .stale
+            .iter()
+            .filter_map(|&idx| direct_candidates.get(idx))
+            .map(|candidate| ApiExcludedVenueInfo {
+                venue_ref: candidate.venue_ref.clone(),
+                reason: ApiExclusionReason::StaleData,
+            })
+            .collect();
+        return Ok((freshness_outcome.fresh.clone(), exclusions));
+    }
+
+    if direct_candidates.is_empty() {
+        return Err(ApiError::NoRouteFound);
+    }
+
+    // Soft-degrade: keep quoting on the latest available orderbook/AMM snapshot.
+    warn!(
+        stale_count = freshness_outcome.stale.len(),
+        max_staleness_secs = freshness_outcome.max_staleness_secs,
+        "All market data is stale; returning degraded quote from available orderbook"
+    );
+
+    let routing_indices = if freshness_outcome.stale.is_empty() {
+        (0..direct_candidates.len()).collect()
+    } else {
+        freshness_outcome.stale.clone()
+    };
+
+    Ok((routing_indices, Vec::new()))
 }
 
 fn evaluate_single_hop_direct_venues(
@@ -1067,7 +1448,10 @@ async fn maybe_invalidate_quote_cache(
     if let Some(cache) = &state.cache {
         if let Ok(mut cache) = cache.try_lock() {
             let revision_key = cache::keys::liquidity_revision(base, quote);
-            let cached_revision = cache.get::<String>(&revision_key).await;
+            let cached_revision = match cache.get::<String>(&revision_key).await {
+                crate::cache::CacheResult::Hit(value) => Some(value),
+                crate::cache::CacheResult::Miss | crate::cache::CacheResult::Unavailable => None,
+            };
 
             if cached_revision.as_deref() != Some(liquidity_revision.as_str()) {
                 if cached_revision.is_some() {
@@ -1077,6 +1461,27 @@ async fn maybe_invalidate_quote_cache(
                         "Liquidity revision changed for {}/{}; invalidated {} quote cache keys",
                         base, quote, deleted
                     );
+
+                    if deleted > 0 {
+                        let payload = QuoteExpirationWebhookPayload {
+                            event_id: Uuid::new_v4().to_string(),
+                            consumer_id: String::new(),
+                            quote_id: format!("invalidated:{base}:{quote}:{liquidity_revision}"),
+                            pair: format!("{base}/{quote}"),
+                            reason: "cache_invalidated".to_string(),
+                            expired_at: chrono::Utc::now().timestamp_millis(),
+                            event: "quote.expired".to_string(),
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                            base_asset: base.to_string(),
+                            quote_asset: quote.to_string(),
+                            amount_in: String::new(),
+                        };
+
+                        state
+                            .quote_expiration_webhooks
+                            .clone()
+                            .spawn_dispatch_to_all(payload);
+                    }
                 }
 
                 let _ = cache
@@ -1108,7 +1513,10 @@ async fn fetch_source_candidates(
                     price::text as price,
                     available_amount::text as available_amount,
                     price_e7,
-                    available_amount_e7
+                    available_amount_e7,
+                    coalesce(source_trace_id, '') as source_trace_id,
+                    coalesce(source_span_id, '') as source_span_id,
+                    updated_at
                 from normalized_liquidity
         where selling_asset_id = $1
           and buying_asset_id = $2
@@ -1133,6 +1541,9 @@ async fn fetch_source_candidates(
                 .unwrap_or(0.0);
             let price_e7: i64 = row.get("price_e7");
             let available_amount_e7: i64 = row.get("available_amount_e7");
+            let source_trace_id: String = row.get("source_trace_id");
+            let source_span_id: String = row.get("source_span_id");
+            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
             DirectVenueCandidate {
                 venue_type,
                 venue_ref,
@@ -1140,6 +1551,13 @@ async fn fetch_source_candidates(
                 available_amount,
                 price_e7,
                 available_amount_e7,
+                source_trace_id,
+                source_span_id,
+                is_inverse: false,
+                fee_bps: 0,
+                // Honest: no provider column in normalized_liquidity today.
+                provider: None,
+                updated_at: Some(updated_at),
             }
         })
         .collect())
@@ -1174,10 +1592,18 @@ async fn find_asset_id(state: &AppState, asset: &AssetPath) -> Result<uuid::Uuid
     let asset_type = asset.to_asset_type();
 
     let row = if asset.asset_code == "native" {
+        // Native rows were historically inserted with NULL code/issuer, so the
+        // unique constraint does not dedupe them. Prefer the asset id that
+        // actually backs live SDEX offers.
         sqlx::query(
             r#"
-            select id from assets
-            where asset_type = $1
+            select a.id
+            from assets a
+            left join sdex_offers o
+              on o.selling_asset_id = a.id or o.buying_asset_id = a.id
+            where a.asset_type = $1
+            group by a.id, a.created_at
+            order by count(o.offer_id) desc, a.created_at asc
             limit 1
             "#,
         )
@@ -1211,11 +1637,58 @@ async fn find_asset_id(state: &AppState, asset: &AssetPath) -> Result<uuid::Uuid
 }
 
 /// Convert AssetPath to AssetInfo
-fn asset_path_to_info(asset: &AssetPath) -> AssetInfo {
+pub(crate) fn asset_path_to_info(asset: &AssetPath) -> AssetInfo {
     if asset.asset_code == "native" {
         AssetInfo::native()
     } else {
         AssetInfo::credit(asset.asset_code.clone(), asset.asset_issuer.clone())
+    }
+}
+
+pub(crate) async fn get_quote_for_pair_dry_run(
+    state: Arc<AppState>,
+    base_asset: AssetPath,
+    quote_asset: AssetPath,
+    params: QuoteParams,
+) -> Result<QuoteResponse> {
+    let (prepared, _) = get_quote_inner(state, base_asset, quote_asset, params, false).await?;
+    prepared.into_quote()
+}
+
+/// Identify the integrator consumer (if any) for quote-expiration webhook
+/// dispatch, using the same `api_key:<key>` scheme as webhook registration
+/// (see `integrator_webhooks::resolve_consumer_id`). Returns `None` when the
+/// caller didn't authenticate with an API key, since anonymous callers have
+/// no registered webhook to notify.
+fn extract_consumer_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("api_key:{value}"))
+}
+
+/// Build the payload dispatched to a consumer's registered webhook when
+/// their quote is expected to expire.
+fn build_quote_webhook_payload(
+    consumer_id: String,
+    base: &str,
+    quote: &str,
+    quote_resp: &QuoteResponse,
+) -> QuoteExpirationWebhookPayload {
+    QuoteExpirationWebhookPayload {
+        event_id: Uuid::new_v4().to_string(),
+        consumer_id,
+        quote_id: format!("{base}:{quote}:{}", quote_resp.timestamp),
+        pair: format!("{base}/{quote}"),
+        reason: "quote_expired".to_string(),
+        expired_at: quote_resp.expires_at.unwrap_or(quote_resp.timestamp),
+        event: "quote.expired".to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        base_asset: base.to_string(),
+        quote_asset: quote.to_string(),
+        amount_in: quote_resp.amount.clone(),
     }
 }
 
@@ -1289,6 +1762,26 @@ fn build_audit_exclusions(quote: &QuoteResponse) -> Vec<AuditExclusion> {
         .unwrap_or_default()
 }
 
+fn build_sparse_quote_data(quote: &QuoteResponse, selected_fields: &[String]) -> Result<Value> {
+    let serialized = serde_json::to_value(quote)
+        .map_err(|e| ApiError::Internal(Arc::new(anyhow::anyhow!(e))))?;
+
+    let data_obj = serialized.as_object().ok_or_else(|| {
+        ApiError::Internal(Arc::new(anyhow::anyhow!(
+            "quote payload did not serialize to an object"
+        )))
+    })?;
+
+    let mut sparse = Map::new();
+    for field in selected_fields {
+        if let Some(value) = data_obj.get(field) {
+            sparse.insert(field.clone(), value.clone());
+        }
+    }
+
+    Ok(Value::Object(sparse))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1792,7 @@ mod tests {
         venue_ref: &str,
         price: f64,
         available_amount: f64,
+        fee_bps: u32,
     ) -> DirectVenueCandidate {
         DirectVenueCandidate {
             venue_type: venue_type.to_string(),
@@ -1307,15 +1801,78 @@ mod tests {
             available_amount,
             price_e7: (price * 1e7) as i64,
             available_amount_e7: (available_amount * 1e7) as i64,
+            fee_bps,
+            is_inverse: false,
+            source_trace_id: "".to_string(),
+            source_span_id: "".to_string(),
+            provider: None,
+            updated_at: Some(chrono::Utc::now()),
         }
+    }
+
+    #[test]
+    fn all_stale_liquidity_soft_degrades_instead_of_rejecting() {
+        let now = chrono::Utc::now();
+        let stale = DirectVenueCandidate {
+            updated_at: Some(now - chrono::Duration::seconds(120)),
+            ..candidate("sdex", "offer1", 1.0, 100.0, 0)
+        };
+        let freshness = FreshnessOutcome {
+            fresh: vec![],
+            stale: vec![0],
+            max_staleness_secs: 120,
+        };
+
+        let (indices, exclusions) =
+            select_routing_indices_after_freshness(&freshness, &[stale]).expect("soft degrade");
+        assert_eq!(indices, vec![0]);
+        assert!(exclusions.is_empty());
+    }
+
+    #[test]
+    fn empty_candidates_after_freshness_are_no_route() {
+        let freshness = FreshnessOutcome {
+            fresh: vec![],
+            stale: vec![],
+            max_staleness_secs: 0,
+        };
+        let err = select_routing_indices_after_freshness(&freshness, &[])
+            .expect_err("empty book must be no_route");
+        assert!(matches!(err, ApiError::NoRouteFound));
+    }
+
+    #[test]
+    fn mixed_freshness_routes_on_fresh_and_excludes_stale() {
+        let now = chrono::Utc::now();
+        let candidates = vec![
+            DirectVenueCandidate {
+                updated_at: Some(now - chrono::Duration::seconds(5)),
+                ..candidate("sdex", "fresh", 1.0, 100.0, 0)
+            },
+            DirectVenueCandidate {
+                updated_at: Some(now - chrono::Duration::seconds(90)),
+                ..candidate("sdex", "stale", 1.01, 100.0, 0)
+            },
+        ];
+        let freshness = FreshnessOutcome {
+            fresh: vec![0],
+            stale: vec![1],
+            max_staleness_secs: 90,
+        };
+
+        let (indices, exclusions) =
+            select_routing_indices_after_freshness(&freshness, &candidates).expect("mixed");
+        assert_eq!(indices, vec![0]);
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(exclusions[0].venue_ref, "stale");
     }
 
     #[test]
     fn selects_best_executable_direct_venue() {
         let candidates = vec![
-            candidate("amm", "pool1", 1.02, 100.0),
-            candidate("sdex", "offer2", 1.01, 25.0),
-            candidate("sdex", "offer1", 1.00, 75.0),
+            candidate("amm", "pool1", 1.02, 100.0, 30),
+            candidate("sdex", "offer2", 1.01, 25.0, 0),
+            candidate("sdex", "offer1", 1.00, 75.0, 0),
         ];
 
         let (selected, rationale) =
@@ -1328,11 +1885,27 @@ mod tests {
     }
 
     #[test]
+    fn native_usdc_quote_prefers_lowest_executable_direct_price() {
+        let candidates = vec![
+            candidate("amm", "pool-native-usdc", 1.02, 100.0, 30),
+            candidate("sdex", "offer-native-usdc-b", 1.01, 80.0, 0),
+            candidate("sdex", "offer-native-usdc-a", 0.99, 60.0, 0),
+        ];
+
+        let (selected, rationale) =
+            evaluate_single_hop_direct_venues(candidates, 50.0).expect("must select a venue");
+
+        assert_eq!(selected.venue_type, "sdex");
+        assert_eq!(selected.venue_ref, "offer-native-usdc-a");
+        assert_eq!(rationale.selected_source, "sdex:offer-native-usdc-a");
+    }
+
+    #[test]
     fn tie_break_is_deterministic_by_venue_then_ref() {
         let candidates = vec![
-            candidate("sdex", "offer2", 1.0, 100.0),
-            candidate("amm", "pool1", 1.0, 100.0),
-            candidate("sdex", "offer1", 1.0, 100.0),
+            candidate("sdex", "offer2", 1.0, 100.0, 0),
+            candidate("amm", "pool1", 1.0, 100.0, 30),
+            candidate("sdex", "offer1", 1.0, 100.0, 0),
         ];
 
         let (selected, rationale) =
@@ -1356,8 +1929,8 @@ mod tests {
     #[test]
     fn insufficient_liquidity_returns_no_route() {
         let candidates = vec![
-            candidate("amm", "pool1", 1.0, 5.0),
-            candidate("sdex", "offer1", 0.99, 2.0),
+            candidate("amm", "pool1", 1.0, 5.0, 30),
+            candidate("sdex", "offer1", 0.99, 2.0, 0),
         ];
 
         let result = evaluate_single_hop_direct_venues(candidates, 10.0);
@@ -1455,7 +2028,7 @@ mod tests {
         // The stale candidate has been excluded by freshness filtering before this call.
         // Only the fresh-but-low-liquidity candidate reaches evaluate_single_hop_direct_venues.
         let fresh_candidates = vec![
-            candidate("sdex", "offer_fresh", 1.0, 5.0), // fresh but only 5 units available
+            candidate("sdex", "offer_fresh", 1.0, 5.0, 0), // fresh but only 5 units available
         ];
         // Request 100 units — exceeds the fresh candidate's available_amount.
         let result = evaluate_single_hop_direct_venues(fresh_candidates, 100.0);
@@ -1477,8 +2050,8 @@ mod tests {
     fn mixed_freshness_with_sufficient_fresh_liquidity_succeeds() {
         // Stale candidate already filtered out; only these fresh candidates remain.
         let fresh_candidates = vec![
-            candidate("amm", "pool_fresh", 1.05, 200.0),
-            candidate("sdex", "offer_fresh", 1.02, 150.0),
+            candidate("amm", "pool_fresh", 1.05, 200.0, 30),
+            candidate("sdex", "offer_fresh", 1.02, 150.0, 0),
         ];
         let amount = 100.0;
 
@@ -1575,6 +2148,80 @@ mod tests {
         assert_eq!(data_freshness.fresh_count, 1);
         assert_eq!(data_freshness.max_staleness_secs, 300);
     }
+
+    fn sample_quote_response() -> QuoteResponse {
+        QuoteResponse {
+            base_asset: AssetInfo::native(),
+            quote_asset: AssetInfo::credit("USDC".to_string(), Some("GISSUER".to_string())),
+            amount: "100.0000000".to_string(),
+            price: "1.0500000".to_string(),
+            total: "105.0000000".to_string(),
+            quote_type: "sell".to_string(),
+            degraded: false,
+            path: vec![],
+            timestamp: 1_700_000_000_000,
+            expires_at: Some(1_700_000_030_000),
+            source_timestamp: Some(1_700_000_000_000),
+            ttl_seconds: Some(30),
+            rationale: None,
+            price_impact: Some("0.10".to_string()),
+            exclusion_diagnostics: None,
+            data_freshness: None,
+            midpoint: Some("1.0450000".to_string()),
+            spread_bps: Some(15),
+        }
+    }
+
+    #[test]
+    fn sparse_fields_common_price_combo() {
+        let quote = sample_quote_response();
+        let fields = vec![
+            "price".to_string(),
+            "total".to_string(),
+            "timestamp".to_string(),
+        ];
+
+        let sparse = build_sparse_quote_data(&quote, &fields).expect("sparse payload");
+        let obj = sparse.as_object().expect("object");
+
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("price"));
+        assert!(obj.contains_key("total"));
+        assert!(obj.contains_key("timestamp"));
+    }
+
+    #[test]
+    fn sparse_fields_common_asset_combo() {
+        let quote = sample_quote_response();
+        let fields = vec![
+            "base_asset".to_string(),
+            "quote_asset".to_string(),
+            "path".to_string(),
+        ];
+
+        let sparse = build_sparse_quote_data(&quote, &fields).expect("sparse payload");
+        let obj = sparse.as_object().expect("object");
+
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("base_asset"));
+        assert!(obj.contains_key("quote_asset"));
+        assert!(obj.contains_key("path"));
+    }
+
+    #[test]
+    fn sparse_fields_omits_unselected_values() {
+        let quote = sample_quote_response();
+        let fields = vec!["price".to_string()];
+
+        let sparse = build_sparse_quote_data(&quote, &fields).expect("sparse payload");
+        let obj = sparse.as_object().expect("object");
+
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("price"));
+        assert!(!obj.contains_key("total"));
+        assert!(!obj.contains_key("base_asset"));
+    }
+
     #[tokio::test]
     async fn test_parallel_execution_latency() {
         use std::time::{Duration, Instant};

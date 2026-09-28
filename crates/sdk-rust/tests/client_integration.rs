@@ -7,7 +7,10 @@
 //! Run with:
 //!   cargo test -p stellarroute-sdk
 
-use stellarroute_sdk::{ApiErrorCode, ClientBuilder, QuoteRequest, QuoteType, SdkError};
+use std::time::Duration;
+use stellarroute_sdk::{
+    ApiErrorCode, ClientBuilder, QuoteRequest, QuoteType, RoutesRequest, SdkError,
+};
 use wiremock::{
     matchers::{method, path, query_param},
     Mock, MockServer, ResponseTemplate,
@@ -21,6 +24,17 @@ async fn mock_server() -> MockServer {
 
 fn client(server: &MockServer) -> stellarroute_sdk::StellarRouteClient {
     ClientBuilder::new(server.uri()).build().unwrap()
+}
+
+fn client_with_retries(
+    server: &MockServer,
+    max_retries: u32,
+) -> stellarroute_sdk::StellarRouteClient {
+    ClientBuilder::new(server.uri())
+        .max_retries(max_retries)
+        .base_backoff(Duration::from_millis(10))
+        .build()
+        .unwrap()
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -112,6 +126,12 @@ async fn orderbook_returns_bids_and_asks() {
             },
             "bids": [{ "price": "0.1050000", "amount": "500.0000000", "total": "52.5000000" }],
             "asks": [{ "price": "0.1060000", "amount": "300.0000000", "total": "31.8000000" }],
+            "summary": {
+                "bid": "0.1050000",
+                "ask": "0.1060000",
+                "spread_bps": 95,
+                "midpoint": "0.1055000"
+            },
             "timestamp": 1740312000
         })))
         .mount(&server)
@@ -263,6 +283,150 @@ async fn quote_validation_error_maps_to_typed_error() {
     assert_eq!(err.status_code(), Some(400));
 }
 
+// ── Routes ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn routes_sends_expected_query_params_and_deserializes_response() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/routes/native/USDC"))
+        .and(query_param("amount", "1000000"))
+        .and(query_param("slippage_bps", "50"))
+        .and(query_param("quote_type", "sell"))
+        .and(wiremock::matchers::header_regex("user-agent", r"^stellarroute-sdk-rust/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "base_asset": { "asset_type": "native", "asset_code": null, "asset_issuer": null },
+            "quote_asset": {
+                "asset_type": "credit_alphanum4",
+                "asset_code": "USDC",
+                "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+            },
+            "amount": "1000000",
+            "routes": [
+                {
+                    "estimated_output": "1005000",
+                    "impact_bps": 12,
+                    "score": 0.98,
+                    "policy_used": "best_price",
+                    "path": [
+                        {
+                            "from_asset": { "asset_type": "native", "asset_code": null, "asset_issuer": null },
+                            "to_asset": {
+                                "asset_type": "credit_alphanum4",
+                                "asset_code": "USDC",
+                                "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+                            },
+                            "price": "1.0050000",
+                            "source": "sdex"
+                        }
+                    ]
+                }
+            ],
+            "timestamp": 1740312000
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server)
+        .routes(RoutesRequest {
+            base: "native",
+            quote: "USDC",
+            amount: 1_000_000,
+            slippage_bps: Some(50),
+            quote_type: Some(QuoteType::Sell),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resp.amount, "1000000");
+    assert_eq!(resp.routes[0].estimated_output, "1005000");
+    assert_eq!(resp.routes[0].path[0].source, "sdex");
+}
+
+#[tokio::test]
+async fn routes_no_route_maps_to_no_route_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/routes/native/GHOST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "no_route",
+            "message": "No trading route found for this pair"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .routes(RoutesRequest {
+            base: "native",
+            quote: "GHOST",
+            amount: 1_000_000,
+            slippage_bps: None,
+            quote_type: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        SdkError::Api {
+            code: ApiErrorCode::NoRoute,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires live StellarRoute API"]
+async fn test_routes_returns_response() {
+    let client = stellarroute_sdk::StellarRouteClient::new(
+        &std::env::var("STELLARROUTE_API_URL")
+            .expect("STELLARROUTE_API_URL must be set to run live tests"),
+    )
+    .expect("client construction should not fail with a valid URL");
+
+    let response = client
+        .routes(RoutesRequest {
+            base: "native",
+            quote: "USDC",
+            amount: 1_000_000,
+            slippage_bps: Some(100),
+            quote_type: Some(QuoteType::Sell),
+        })
+        .await
+        .expect("routes request should succeed against live API");
+
+    assert!(!response.routes.is_empty(), "expected at least one route");
+}
+
+#[tokio::test]
+#[ignore = "requires live StellarRoute API — uses a known-unroutable pair"]
+async fn test_routes_no_route_returns_correct_error() {
+    let client = stellarroute_sdk::StellarRouteClient::new(
+        &std::env::var("STELLARROUTE_API_URL").expect("STELLARROUTE_API_URL must be set"),
+    )
+    .unwrap();
+
+    let err = client
+        .routes(RoutesRequest {
+            base: "native",
+            quote: "NONEXISTENT_ASSET_ABC123",
+            amount: 1_000_000,
+            slippage_bps: None,
+            quote_type: None,
+        })
+        .await
+        .expect_err("should return an error for unroutable pair");
+
+    match err {
+        SdkError::Api { code, .. } => assert_eq!(
+            code,
+            ApiErrorCode::NoRoute,
+            "expected NoRoute error code, got: {code:?}"
+        ),
+        other => panic!("expected API error, got: {other:?}"),
+    }
+}
+
 // ── Error handling ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -397,6 +561,14 @@ fn api_error_code_roundtrip() {
         "internal_error".parse::<ApiErrorCode>().unwrap(),
         ApiErrorCode::InternalError
     );
+    assert_eq!(
+        "stale_market_data".parse::<ApiErrorCode>().unwrap(),
+        ApiErrorCode::StaleMarketData
+    );
+    assert_eq!(
+        "overloaded".parse::<ApiErrorCode>().unwrap(),
+        ApiErrorCode::Overloaded
+    );
 
     let other = "custom_code".parse::<ApiErrorCode>().unwrap();
     assert_eq!(other.as_str(), "custom_code");
@@ -408,4 +580,447 @@ fn quote_type_display() {
     assert_eq!(QuoteType::Sell.as_str(), "sell");
     assert_eq!(QuoteType::Buy.as_str(), "buy");
     assert_eq!(QuoteType::Sell.to_string(), "sell");
+}
+
+// ── Retry behavior ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn retries_on_429_then_succeeds() {
+    let server = mock_server().await;
+
+    // First response: 429 with Retry-After
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_json(serde_json::json!({
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many requests"
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second response: success
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pairs": [],
+            "total": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client_with_retries(&server, 2).pairs().await.unwrap();
+    assert_eq!(resp.total, 0);
+}
+
+#[tokio::test]
+async fn retries_on_5xx_then_succeeds() {
+    let server = mock_server().await;
+
+    // First response: 500
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": "internal_error",
+            "message": "Server error"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second response: success
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "healthy",
+            "timestamp": "2026-03-25T12:00:00Z",
+            "version": "0.1.0",
+            "components": {}
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client_with_retries(&server, 2).health().await.unwrap();
+    assert!(resp.is_healthy());
+}
+
+#[tokio::test]
+async fn retries_exhausted_returns_error() {
+    let server = mock_server().await;
+
+    // All responses are 429
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_json(serde_json::json!({
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many requests"
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client_with_retries(&server, 1).pairs().await.unwrap_err();
+    assert!(err.is_rate_limited());
+    assert_eq!(err.status_code(), Some(429));
+}
+
+#[tokio::test]
+async fn default_no_retries_returns_error_immediately() {
+    let server = mock_server().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "error": "rate_limit_exceeded",
+            "message": "Too many requests"
+        })))
+        .mount(&server)
+        .await;
+
+    // Default client has max_retries = 0
+    let err = client(&server).pairs().await.unwrap_err();
+    assert!(err.is_rate_limited());
+}
+
+#[tokio::test]
+async fn retries_respect_retry_after_header() {
+    let server = mock_server().await;
+
+    // First: 429 with Retry-After: 1
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_json(serde_json::json!({
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many requests"
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second: success
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pairs": [],
+            "total": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let start = std::time::Instant::now();
+    let resp = client_with_retries(&server, 2).pairs().await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.total, 0);
+    // Should have waited at least ~1 second due to Retry-After: 1
+    assert!(elapsed >= Duration::from_millis(900));
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Additional mock tests for pairs + orderbook (issue #1277)
+// These ensure CI stays green without requiring a live API.
+// ────────────────────────────────────────────────────────────────────────────────
+
+// ── Pairs: empty response ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pairs_empty_response_deserializes() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pairs": [],
+            "total": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server).pairs().await.unwrap();
+    assert_eq!(resp.total, 0);
+    assert!(resp.pairs.is_empty());
+}
+
+// ── Pairs: large page ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pairs_large_page_deserializes() {
+    let server = mock_server().await;
+    let pairs: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            serde_json::json!({
+                "base": "XLM",
+                "counter": format!("TOKEN{}", i),
+                "base_asset": "native",
+                "counter_asset": format!("TOKEN{}:GABCD", i),
+                "offer_count": i + 1,
+                "last_updated": "2026-03-25T11:59:00Z"
+            })
+        })
+        .collect();
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pairs": pairs,
+            "total": 100
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server).pairs().await.unwrap();
+    assert_eq!(resp.total, 100);
+    assert_eq!(resp.pairs.len(), 100);
+    assert_eq!(resp.pairs[50].counter, "TOKEN50");
+}
+
+// ── Orderbook: empty bids and asks ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_empty_bids_and_asks_deserializes() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/USDC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "base_asset": { "asset_type": "native", "asset_code": null, "asset_issuer": null },
+            "quote_asset": {
+                "asset_type": "credit_alphanum4",
+                "asset_code": "USDC",
+                "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+            },
+            "bids": [],
+            "asks": [],
+            "summary": {
+                "bid": null,
+                "ask": null,
+                "spread_bps": 0,
+                "midpoint": null
+            },
+            "timestamp": 1740312000
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server).orderbook("native", "USDC").await.unwrap();
+    assert!(resp.base_asset.is_native());
+    assert!(resp.bids.is_empty());
+    assert!(resp.asks.is_empty());
+    assert_eq!(resp.best_bid(), None);
+    assert_eq!(resp.best_ask(), None);
+}
+
+// ── Orderbook: multiple price levels ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_multiple_levels_deserializes() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/USDC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "base_asset": { "asset_type": "native", "asset_code": null, "asset_issuer": null },
+            "quote_asset": {
+                "asset_type": "credit_alphanum4",
+                "asset_code": "USDC",
+                "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+            },
+            "bids": [
+                { "price": "0.1050000", "amount": "500.0000000", "total": "52.5000000" },
+                { "price": "0.1049000", "amount": "1000.0000000", "total": "104.9000000" },
+                { "price": "0.1048000", "amount": "2000.0000000", "total": "209.6000000" }
+            ],
+            "asks": [
+                { "price": "0.1060000", "amount": "300.0000000", "total": "31.8000000" },
+                { "price": "0.1061000", "amount": "500.0000000", "total": "53.0500000" }
+            ],
+            "summary": {
+                "bid": "0.1050000",
+                "ask": "0.1060000",
+                "spread_bps": 95,
+                "midpoint": "0.1055000"
+            },
+            "timestamp": 1740312000
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server).orderbook("native", "USDC").await.unwrap();
+    assert_eq!(resp.bids.len(), 3);
+    assert_eq!(resp.asks.len(), 2);
+    assert_eq!(resp.best_bid(), Some("0.1050000"));
+    assert_eq!(resp.best_ask(), Some("0.1060000"));
+}
+
+// ── Orderbook: credit_alphanum12 asset ───────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_alphanum12_asset_deserializes() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/CUSTOMASSET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "base_asset": { "asset_type": "native", "asset_code": null, "asset_issuer": null },
+            "quote_asset": {
+                "asset_type": "credit_alphanum12",
+                "asset_code": "CUSTOMASSET",
+                "asset_issuer": "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+            },
+            "bids": [{ "price": "1.0000000", "amount": "100.0000000", "total": "100.0000000" }],
+            "asks": [{ "price": "1.0100000", "amount": "50.0000000", "total": "50.5000000" }],
+            "summary": {
+                "bid": "1.0000000",
+                "ask": "1.0100000",
+                "spread_bps": 100,
+                "midpoint": "1.0050000"
+            },
+            "timestamp": 1740312000
+        })))
+        .mount(&server)
+        .await;
+
+    let resp = client(&server)
+        .orderbook("native", "CUSTOMASSET")
+        .await
+        .unwrap();
+    assert!(resp.base_asset.is_native());
+    assert!(!resp.quote_asset.is_native());
+    assert_eq!(resp.quote_asset.asset_code, Some("CUSTOMASSET".to_string()));
+    assert_eq!(
+        resp.quote_asset.asset_issuer,
+        Some("GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890".to_string())
+    );
+}
+
+// ── Orderbook: validation error ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_validation_error_maps_to_typed_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/USDC"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "validation_error",
+            "message": "Invalid asset code"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .orderbook("native", "USDC")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_validation_error());
+    assert_eq!(err.status_code(), Some(400));
+}
+
+// ── Orderbook: server error ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_server_error_maps_to_internal_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/USDC"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": "internal_error",
+            "message": "Orderbook service unavailable"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .orderbook("native", "USDC")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_internal_error());
+    assert_eq!(err.status_code(), Some(500));
+}
+
+// ── Pairs: server error ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pairs_server_error_maps_to_internal_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "service_unavailable",
+            "message": "Pairs service maintenance"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).pairs().await.unwrap_err();
+
+    assert!(err.is_internal_error());
+    assert_eq!(err.status_code(), Some(503));
+}
+
+// ── Pairs: stale market data error ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn pairs_stale_market_data_maps_to_typed_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/pairs"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": "stale_market_data",
+            "message": "Market data is stale, please retry"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).pairs().await.unwrap_err();
+
+    match err {
+        SdkError::Api {
+            code: ApiErrorCode::StaleMarketData,
+            status,
+            ..
+        } => {
+            assert_eq!(status, 409);
+        }
+        other => panic!("expected Api/StaleMarketData, got {other:?}"),
+    }
+}
+
+// ── Orderbook: overloaded error ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn orderbook_overloaded_maps_to_typed_error() {
+    let server = mock_server().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orderbook/native/USDC"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "overloaded",
+            "message": "Orderbook service overloaded"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .orderbook("native", "USDC")
+        .await
+        .unwrap_err();
+
+    match err {
+        SdkError::Api {
+            code: ApiErrorCode::Overloaded,
+            status,
+            ..
+        } => {
+            assert_eq!(status, 503);
+        }
+        other => panic!("expected Api/Overloaded, got {other:?}"),
+    }
 }

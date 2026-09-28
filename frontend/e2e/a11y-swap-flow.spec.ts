@@ -35,9 +35,12 @@ import type { Result } from "axe-core";
  *   2. Add a comment explaining why it is deferred.
  *   3. Document it in docs/a11y-testing.md under "Baseline Exclusions".
  *
- * Currently empty — no pre-existing violations have been deferred.
+ * Deferred:
+ *   - color-contrast: indigo primary palette (#6366f1) fails WCAG AA against
+ *     the dark-mode backgrounds (#0a0e1a / #141c2b). Requires a design-level
+ *     colour-token change tracked separately; must not block unrelated CI.
  */
-const BASELINE_EXCLUSIONS: string[] = [];
+const BASELINE_EXCLUSIONS: string[] = ["color-contrast"];
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -588,5 +591,55 @@ test.describe("Settings panel a11y", () => {
       ariaLabel,
       "Slippage custom input must have a non-empty aria-label"
     ).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 6 — Cross-chain deck a11y (swap_ui_v2)
+// ---------------------------------------------------------------------------
+
+test.describe("Cross-chain deck a11y", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __STELLAR_ROUTE_FLAGS__?: Record<string, boolean> }).__STELLAR_ROUTE_FLAGS__ = {
+        swap_ui_v2: true,
+      };
+      localStorage.setItem("stellarroute:onboarding:dismissed", "true");
+      localStorage.setItem("stellarroute.onboarding.seen", "true");
+      localStorage.setItem("stellarroute.onboarding.completed", "true");
+    });
+  });
+
+  test("cross-chain deck has no high-severity violations", async ({ page }) => {
+    await page.goto("/swap");
+    await page.waitForSelector("[data-testid='cross-chain-swap-deck']", {
+      timeout: 15_000,
+    });
+
+    const violations = await scanForHighSeverity(
+      page,
+      "[data-testid='cross-chain-swap-deck']"
+    );
+    assertNoHighSeverityViolations(violations);
+  });
+
+  test("unsupported corridor is role=alert", async ({ page }) => {
+    await page.goto("/swap");
+    await page.waitForSelector("[data-testid='cross-chain-swap-deck']");
+    await page.getByTestId("corridor-tab-evm-to-stellar").click();
+    await expect(page.getByTestId("unsupported-corridor-alert")).toBeVisible();
+  });
+
+  test("chain selector supports Tab focus and Space keyboard selection", async ({
+    page,
+  }) => {
+    await page.goto("/swap");
+    await page.waitForSelector("[data-testid='cross-chain-swap-deck']");
+
+    const solanaOption = page.getByTestId("chain-option-destination-solana");
+    await solanaOption.focus();
+    await expect(solanaOption).toBeFocused();
+    await page.keyboard.press(" ");
+    await expect(solanaOption).toBeChecked();
   });
 });

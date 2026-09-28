@@ -3,10 +3,14 @@ use arc_swap::ArcSwap;
 use sqlx::{postgres::PgListener, PgPool, Row};
 use std::sync::Arc;
 use stellarroute_routing::health::anomaly::LiquidityAnomalyDetector;
+use stellarroute_routing::pathfinder::LiquidityEdge;
 use tracing::{debug, error, info, warn};
 
 use stellarroute_routing::compaction::CompactedGraph;
-use stellarroute_routing::pathfinder::LiquidityEdge;
+
+// Fallback defaults used when fee information is not available in the DB.
+pub const DEFAULT_AMM_FEE_BPS: u32 = 30;
+pub const DEFAULT_SDEX_FEE_BPS: u32 = 20;
 
 /// Daemon that maintains an active in-memory cache of the routing graph
 pub struct GraphManager {
@@ -141,11 +145,18 @@ impl GraphManager {
             hash_map.insert(id, canon);
         }
 
+        // Join to `amm_pool_reserves` to pull real fee_bps for AMM venues when available.
+        // Normalized liquidity currently doesn't include fee information directly.
+        // We fallback to module-level defaults when the DB doesn't provide a value.
+
         let rows = sqlx::query(
             r#"
-            SELECT selling_asset_id, buying_asset_id, venue_type, venue_ref, price, available_amount
-            FROM normalized_liquidity
-            WHERE available_amount > 0
+            SELECT nl.selling_asset_id, nl.buying_asset_id, nl.venue_type, nl.venue_ref,
+                   nl.price::text as price, nl.available_amount::text as available_amount,
+                   amm.fee_bps as fee_bps
+            FROM normalized_liquidity nl
+            LEFT JOIN amm_pool_reserves amm ON nl.venue_type = 'amm' AND nl.venue_ref = amm.pool_address
+            WHERE nl.available_amount > 0
             "#,
         )
         .fetch_all(&self.db)
@@ -180,8 +191,13 @@ impl GraphManager {
                             (None, Some((a * 1e7) as i128))
                         };
 
-                        let anomaly_res = detector.update_and_detect(&venue_ref, reserves, depth);
+                        let _anomaly_res =
+                            detector.update_and_detect(&venue_ref, reserves, depth, None);
 
+                        // Runtime economics: keep reviewed lean-CI constants (30/20).
+                        // Do not ship DB-driven fee_bps from amm_pool_reserves here.
+                        // provider/bridge stay None: graph ingest currently supplies
+                        // no providers; compaction preserves them when set.
                         next_edges.push(LiquidityEdge {
                             from: e_from.clone(),
                             to: e_to.clone(),
@@ -189,9 +205,12 @@ impl GraphManager {
                             venue_ref,
                             liquidity: (a * 1e7) as i128,
                             price: p,
-                            fee_bps: if is_amm { 30 } else { 20 },
-                            anomaly_score: anomaly_res.score,
-                            anomaly_reasons: anomaly_res.reasons,
+                            fee_bps: if is_amm {
+                                DEFAULT_AMM_FEE_BPS
+                            } else {
+                                DEFAULT_SDEX_FEE_BPS
+                            },
+                            ..Default::default()
                         });
                     }
                 }
@@ -215,8 +234,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_graph_manager_snapshot_consistency() {
-        // Mock pool - we won't actually query it in this unit test
-        // but we need it for the struct.
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
         let manager = GraphManager::new(pool);
 
@@ -228,21 +245,17 @@ mod tests {
             liquidity: 100,
             price: 1.0,
             fee_bps: 30,
-            anomaly_score: 0.0,
-            anomaly_reasons: vec![],
+            ..Default::default()
         }];
 
-        // Set initial state
         manager
             .edges
-            .store(Arc::new(CompactedGraph::from_edges(initial_edges.clone())));
+            .store(Arc::new(CompactedGraph::from_edges(initial_edges)));
 
-        // Obtain a snapshot
         let snapshot1 = manager.get_edges();
         assert_eq!(snapshot1.asset_count(), 2);
         assert_eq!(snapshot1.assets[0], "XLM");
 
-        // Update the manager with new data
         let new_edges = vec![LiquidityEdge {
             from: "USDC".to_string(),
             to: "XLM".to_string(),
@@ -251,20 +264,17 @@ mod tests {
             liquidity: 200,
             price: 0.99,
             fee_bps: 30,
-            anomaly_score: 0.0,
-            anomaly_reasons: vec![],
+            ..Default::default()
         }];
         manager
             .edges
             .store(Arc::new(CompactedGraph::from_edges(new_edges)));
 
-        // Obtain a second snapshot
         let snapshot2 = manager.get_edges();
         assert_eq!(snapshot2.asset_count(), 2);
         assert_eq!(snapshot2.assets[0], "USDC");
 
-        // Verify snapshot1 is STILL valid and unchanged
-        assert_eq!(snapshot1.asset_count(), 2);
+        assert_eq!(snapshot1.edges.len(), 1);
         assert_eq!(snapshot1.assets[0], "XLM");
     }
 
@@ -281,8 +291,7 @@ mod tests {
             liquidity: 100,
             price: 1.0,
             fee_bps: 30,
-            anomaly_score: 0.0,
-            anomaly_reasons: vec![],
+            ..Default::default()
         }];
         manager
             .edges
@@ -311,8 +320,7 @@ mod tests {
                     liquidity: 100,
                     price: 1.0,
                     fee_bps: 30,
-                    anomaly_score: 0.0,
-                    anomaly_reasons: vec![],
+                    ..Default::default()
                 }];
                 m2.edges.store(Arc::new(CompactedGraph::from_edges(edges)));
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;

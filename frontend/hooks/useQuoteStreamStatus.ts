@@ -17,8 +17,11 @@ export interface UseQuoteStreamStatusOptions {
    */
   reconnectGracePeriodMs?: number;
   /**
-   * Active data-delivery mode.
-   * "stream" = WebSocket (future); "polling" = HTTP polling (current default).
+   * Explicit mode override. When omitted the hook derives the mode
+   * automatically from `inputs.wsConnected`.
+   *
+   * "stream"  = WebSocket is healthy (auto-set when wsConnected is true)
+   * "polling" = HTTP polling fallback (default when WS is absent/disconnected)
    */
   mode?: Mode;
 }
@@ -26,10 +29,17 @@ export interface UseQuoteStreamStatusOptions {
 export interface UseQuoteStreamStatusInputs {
   /** True while transient quote failures are being retried (from useQuoteRefresh). */
   isRecovering: boolean;
-  /** Current quote fetch error, if any (from useQuoteRefresh). */
+  /** Current quote fetch error, if any (from useQuoteRefresh or useQuoteStream). */
   error: Error | null;
   /** Browser network connectivity status (from useOnlineStatus). */
   isOnline: boolean;
+  /**
+   * True when the WebSocket quote stream is currently connected and delivering
+   * data (from useQuoteStream / useQuote).
+   * When true the mode is automatically set to "stream".
+   * Default: false (polling mode)
+   */
+  wsConnected?: boolean;
 }
 
 export interface UseQuoteStreamStatusResult {
@@ -50,11 +60,13 @@ export interface UseQuoteStreamStatusResult {
  */
 export function deriveRawStatus(
   isRecovering: boolean,
-  error: Error | null,
+  _error: Error | null,
   isOnline: boolean
 ): ConnectionStatus {
   if (!isOnline) return "disconnected";
-  if (isRecovering || error !== null) return "reconnecting";
+  // Only transient recovery → "reconnecting". Terminal quote errors (no route,
+  // not found) stay "connected" so the UI does not stick on "Reconnecting".
+  if (isRecovering) return "reconnecting";
   return "connected";
 }
 
@@ -65,8 +77,13 @@ export function deriveRawStatus(
 const DEFAULT_GRACE_PERIOD_MS = 3_000;
 
 /**
- * Derives a discrete ConnectionStatus from useQuoteRefresh outputs with
- * flicker suppression via a configurable grace-period debounce.
+ * Derives a discrete ConnectionStatus from useQuoteRefresh / useQuoteStream
+ * outputs with flicker suppression via a configurable grace-period debounce.
+ *
+ * Mode derivation (in priority order):
+ *  1. `options.mode` explicit override (if "stream" or "polling")
+ *  2. `inputs.wsConnected === true`  →  "stream"
+ *  3. fallback                       →  "polling"
  *
  * Transition rules:
  * - connected → reconnecting: debounced by reconnectGracePeriodMs (default 3 s)
@@ -83,6 +100,7 @@ export function useQuoteStreamStatus(
     isRecovering = false,
     error = null,
     isOnline = true,
+    wsConnected = false,
   } = inputs;
 
   const gracePeriodMs =
@@ -91,10 +109,13 @@ export function useQuoteStreamStatus(
       ? options.reconnectGracePeriodMs
       : DEFAULT_GRACE_PERIOD_MS;
 
+  // Derive mode: explicit override → wsConnected auto-detect → polling default
   const mode: Mode =
     options.mode === "stream" || options.mode === "polling"
       ? options.mode
-      : "polling";
+      : wsConnected
+        ? "stream"
+        : "polling";
 
   const rawStatus = deriveRawStatus(isRecovering, error, isOnline);
 
@@ -104,6 +125,7 @@ export function useQuoteStreamStatus(
   // Single pending timer ref — reset on each new connected→reconnecting entry
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
     // Immediate transition: offline always wins
     if (rawStatus === "disconnected") {
